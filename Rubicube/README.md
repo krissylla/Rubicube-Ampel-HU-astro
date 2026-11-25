@@ -53,4 +53,8 @@ Added:
     * `Single alert explorer.ipynb`: Reads in the latest neutrino alert from the kafka stream and writes the ampel job file `Rubicube/ampel job files/TEST_ic_alert_ZTF_processor.yaml`. The job file can then be run with:
     ``` poetry run ampel job Rubicube/ampel\ job\ files/TEST_ic_alert_ZTF_processor.yaml -config ampel_conf.yaml -secrets secrets.yaml -reset-db```
 
+* `Rubin Alerts`: Adapting things to rubin alerts
+    * `generate_IC_map.ipynb`: notebook where you can set a RA, DEC, and time, and you output an IC alert
+    * `ic_map_generator.py`: methods for map generating
+
 * `bayesian analysis`: Here we are building the simulation to test the bayesian framework. It uses functions from another simulation code [TransientSimulation](https://github.com/krissylla/TransientSimulation), so this needs to be downloaded first to be able to test things here.  
