@@ -8,6 +8,7 @@
 # Last Modified By:    jnordin@physik.hu-berlin.de
 
 import os
+from pathlib import Path
 from typing import Any
 
 import joblib
@@ -29,6 +30,7 @@ from ampel.contrib.hu.model.ParsnipRiseDeclineResult import (
     ParsnipResult,
     PredictionEntry,
 )
+from ampel.model.ExternalDataModel import ExternalDataModel
 from ampel.model.PlotSpec import PlotSpec
 from ampel.model.UnitModel import UnitModel
 
@@ -72,13 +74,22 @@ parsnip_taxonomy = {
 
 
 class ParsnipModelFiles(TypedDict):
-    model: str
-    classifier: str
+    model: str | ExternalDataModel
+    classifier: str | ExternalDataModel
 
 
 class XgbMultiModelFiles(TypedDict):
-    path: str
+    path: str | ExternalDataModel
     classes: list[int | str]
+
+
+def get_local_path(path: str | ExternalDataModel) -> Path:
+    """
+    Return the local path to a file, downloading it if necessary.
+    """
+    if isinstance(path, ExternalDataModel):
+        return path.local_path()
+    return Path(path)
 
 
 def create_parsnip_plot(
@@ -111,6 +122,28 @@ def create_parsnip_plot(
     finally:
         fig.clear()
         plt.close(fig)
+
+
+def parsnip_model_zmax(model: parsnip.ParsnipModel) -> float:
+    """Highest redshift a parsnip model can evaluate without crashing.
+
+    Parsnip interpolates precomputed per-band weights on a fixed grid. At
+    redshift z the interpolation index is shifted by
+    ``log10(1 + z) / band_interpolate_spacing`` in wavelength-log space, and
+    the shift is read both at ``int_locs`` and ``int_locs + 1``. Beyond the
+    grid end this raises an IndexError (
+    e.g. ``index 25522 is out of bounds for dimension 0 with size 25485``).
+
+    This returns the largest redshift whose shifted index still leaves one
+    element of headroom for the ``+ 1`` neighbour.
+    """
+    n = model.band_interpolate_weights.shape[-1]
+    loc_max = float(model.band_interpolate_locations.max())
+    spacing = float(model.band_interpolate_spacing)
+    budget = (n - 2) - loc_max
+    if budget <= 0 or spacing <= 0:
+        return 0.0
+    return 10 ** (budget * spacing) - 1
 
 
 def run_parsnip_zsample(
@@ -238,7 +271,7 @@ class T2BaseClassifier:
     classifier_version: str
 
     ## Paths to classifiers to load.
-    paths_xgbbinary: dict[str, str] = {}
+    paths_xgbbinary: dict[str, str | ExternalDataModel] = {}
     paths_xgbmulti: dict[str, XgbMultiModelFiles] = {}
     paths_parsnip: dict[str, ParsnipModelFiles] = {}
 
@@ -259,16 +292,24 @@ class T2BaseClassifier:
 
     def read_class_models(self) -> None:
         self._class_xgbbinary = {
-            label: joblib.load(path) for label, path in self.paths_xgbbinary.items()
+            label: joblib.load(get_local_path(path))
+            for label, path in self.paths_xgbbinary.items()
         }
         self._class_xgbmulti: dict[str, Any] = {
-            label: {**joblib.load(pathdir["path"]), "classes": pathdir["classes"]}
+            label: {
+                **joblib.load(get_local_path(pathdir["path"])),
+                "classes": pathdir["classes"],
+            }
             for label, pathdir in self.paths_xgbmulti.items()
         }
         self._class_parsnip = {
             label: {
-                "classifier": parsnip.Classifier.load(paths["classifier"]),
-                "model": parsnip.load_model(paths["model"], threads=1),
+                "classifier": parsnip.Classifier.load(
+                    get_local_path(paths["classifier"])
+                ),
+                "model": parsnip.load_model(
+                    str(get_local_path(paths["model"])), threads=1
+                ),
             }
             for label, paths in self.paths_parsnip.items()
         }
@@ -342,13 +383,30 @@ class T2BaseClassifier:
         Also limit to max model redshift.
         """
 
-        zw = [1.0 / len(zsample) for z in zsample] if zweights is None else zweights
+        model = self._class_parsnip[model_label]["model"]
+
+        # Restrict to redshifts the model's band-weight grid can evaluate.
+        # Above this limit parsnip's interpolation index runs off the end of
+        # the grid and raises an IndexError (see parsnip_model_zmax).
+        zmax = parsnip_model_zmax(model)
+        if zweights is None:
+            pairs = [(z, 1.0 / len(zsample)) for z in zsample if z <= zmax]
+        else:
+            pairs = [
+                (z, w) for z, w in zip(zsample, zweights, strict=True) if z <= zmax
+            ]
+
+        if not pairs:
+            # All sampled redshifts exceed the model range: nothing to fit.
+            return ParsnipFailure(model=model_label, failed="RedshiftOutOfRange")
+
+        zs, zw = map(list, zip(*pairs, strict=True))
 
         return run_parsnip_zsample(
             lctable,
-            zsample,
+            zs,
             zw,
-            model=self._class_parsnip[model_label]["model"],
+            model=model,
             classifier=self._class_parsnip[model_label]["classifier"],
             label=model_label,
             plot=self.parsnipplot_properties,
