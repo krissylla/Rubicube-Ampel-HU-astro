@@ -1,0 +1,22 @@
+name: classificationFromToken
+mongo:
+  prefix: rubicube
+channel:
+- name: ztfrealtimeclass
+  access:
+  - ZTF
+  - ZTF_PUB
+  - ZTF_PRIV
+  policy: []
+task:
+- title: token
+  unit: T4Processor
+  config:
+    raise_exc: true
+    execute:
+    - unit: T4RunTimeContextUpdater
+      config:
+        execute:
+        - unit: SimpleLogger
+          config:
+            message: 'LOGGER TEST MESSAGE'

@@ -18,7 +18,14 @@ from hashlib import blake2b
 import healpy as hp
 import numpy as np
 import requests
+from astropy import units as u
 from astropy.time import Time
+
+#From cris
+from astropy.table import QTable
+from mhealpy import HealpixMap
+import astropy_healpix as ah
+
 
 # ruff: noqa: T201
 
@@ -53,6 +60,9 @@ class AmpelHealpix:
         self.credible_levels = np.empty(0)
         self.trigger_time: None | float = None
 
+        #cris
+        self.sorted_credible_levels = None
+
     def _get_map(self, clobber=False) -> int:
         path = os.path.join(self.save_dir, self.map_name)
         # print(path)
@@ -67,50 +77,57 @@ class AmpelHealpix:
             fh.write(map_data.content)
 
         return 0
+    
+
 
     def process_map(self) -> str:
         """
         Load map and determine prob values.
         """
 
-        # print(os.path.join(self.save_dir, self.map_name))
+        skymap = QTable.read( os.path.join(self.save_dir, self.map_name) )
+        headers = skymap.meta
+        prob_density = skymap['PROBDENSITY'].to_value(u.deg**-2)
+        m = HealpixMap(data=prob_density, uniq=skymap['UNIQ'], density=True)
+        pixel_areas = m.pixarea().to_value(u.deg**2) #* (180/np.pi)**2  # Convert steradians to deg^2
 
-        # Process map
-        hpx, headers = hp.read_map(
-            os.path.join(self.save_dir, self.map_name), h=True, nest=True
-        )
-        # print("HEADERS")
-        # print(headers)
-        # print(type(headers))
-        # print("END HEADERS")
 
-        trigger_time = next(
-            datetime.fromisoformat(header[1])
-            for header in headers
-            if header[0] == "DATE-OBS"
-        )
+        # Determine trigger time
+        # New icecube / mhealpy format
+        if isinstance(headers, dict) and "DATE-OBS" in headers:
+            trigger_time = headers["DATE-OBS"]
+            trigger_time = datetime.fromisoformat(trigger_time)
+        else:
+            # Old ligo format
+            trigger_time = next(
+                datetime.fromisoformat(header[1])
+                for header in headers
+                if header[0] == "DATE-OBS"
+            )
 
-        nside = int(hp.npix2nside(len(hpx)))
-
-        # Downgrade resolution
-        if self.nside and self.nside < nside:
-            hpx = hp.ud_grade(
-                hpx,
+        # Check resolution and possible change 
+        if self.nside and self.nside < m.nside:
+            print("Downgrading map from nside ", m.nside, " to ", self.nside) #TODO: Do we need this?
+            m = m.ud_grade(
                 nside_out=self.nside,
-                order_in="NESTED",
-                order_out="NESTED",
-                power=-2,
+                power=-1,   # weigted average, conserves total probability
             )
         else:
-            self.nside = nside
+            self.nside = m.nside
 
-        # print(headers)
-        self.dist = next(header[1] for header in headers if header[0] == "DISTMEAN")
-        # for header in headers:
-        # print(header[1], header[0])
 
-        # print(self.dist)
-        self.dist_unc = next(header[1] for header in headers if header[0] == "DISTSTD")
+        #Info only for GW detections. If IC map, we don't need this:
+        try:
+            # Will likely fail for new mhealpy format
+            self.dist = next(header[1] for header in headers if header[0] == "DISTMEAN")
+        except StopIteration:
+            self.dist = None
+
+        try:
+            # Only for GW, not mo icecube alerts
+            self.dist_unc = next(header[1] for header in headers if header[0] == "DISTSTD")
+        except StopIteration:
+            self.dist_unc = None
 
         seed_list = [header[1] for header in headers if header[0] == "SEED"]
         if len(seed_list) > 0:
@@ -119,13 +136,31 @@ class AmpelHealpix:
             self.seed = self.map_name.replace(".fits.gz", "").replace(",", "_")
 
         # Find credible levels
-        idx = np.flipud(np.argsort(hpx))
 
-        sorted_credible_levels = np.cumsum(hpx[idx].astype(float))
+        # mhealpy, trying to take pixel area into account
+        idx = np.flipud( np.argsort(m.data) ) #TODO: from single-order map, not sure if we need this
+
+        skymap.sort("PROBDENSITY", reverse=True)
+
+        #CRIS: Check if array has masked values. We fill them with 0.0
+        try:
+            if skymap['PROBDENSITY'].mask.any():
+                print("Map has masked values. reeplacing them with 0")
+                skymap['PROBDENSITY'] = skymap['PROBDENSITY'].filled(0)
+        except AttributeError:
+            pass #array has no masked values
+        level, ipix = ah.uniq_to_level_ipix(skymap["UNIQ"])
+        nside = ah.level_to_nside(level)
+        pixel_area = ah.nside_to_pixel_area(nside)
+        prob = pixel_area * skymap["PROBDENSITY"]
+        sorted_credible_levels = np.cumsum(prob)
+
         credible_levels = np.empty_like(sorted_credible_levels)
         credible_levels[idx] = sorted_credible_levels
 
+
         self.credible_levels = credible_levels
+        self.sorted_credible_levels = sorted_credible_levels
         self.trigger_time = Time(trigger_time).jd
 
         return b64encode(
@@ -152,17 +187,19 @@ class AmpelHealpix:
 
         return mask.nonzero()[0].tolist()
 
-    def get_maparea(self, pvalue_limit: float) -> float:
+    def get_maparea(self, pvalue_limit: float, healpix_regions=None) -> float:
         """
+        TODO: this only works for single order maps, can we do this with self.sorted_credible_levels?
         Return sky area for probability threshold in square degrees.
         """
 
-        pixels = self.get_pixelmask(pvalue_limit)
-        # Combine pixels when possible
-        deresdict = deres(self.nside, pixels)
-        healpix_regions = [
-            {"nside": nside, "pixels": members} for nside, members in deresdict.items()
-        ]
+        if not healpix_regions:
+            pixels = self.get_pixelmask(pvalue_limit)
+            # Combine pixels when possible
+            deresdict = deres(self.nside, pixels)
+            healpix_regions = [
+                {"nside": nside, "pixels": members} for nside, members in deresdict.items()
+            ]
         # calculate relevant map area
         hp_area = 0.0
         for region in healpix_regions:
@@ -199,35 +236,187 @@ class AmpelHealpix:
 
         return self.dist, self.dist_unc
 
+    #cris attempt
+    # def get_hpx_regions(self, p_value):
+    #     '''
+    #     This function should combine get_pixel_mask and deres
+    #     We will use the slef.sorted_credible_levels to get the limit set by the p_value
+    #     p_value = 0.9 -> 90% confidence region in the IC map
+    #     p_value = 0.5 -> 50% confidence region in the IC map
+    #     '''
+    #     i_region = self.sorted_credible_levels.searchsorted(p_value)
 
-def deres(nside, ipix, min_nside=1):
+    #     #TODO: we calculate this bvadly again, we should keep this info from process_map 
+
+    #     skymap = QTable.read(os.path.join(self.save_dir, self.map_name) )
+    #     prob_density = skymap['PROBDENSITY'].to_value(u.deg**-2)
+    #     skymap.sort("PROBDENSITY", reverse=True)
+    #     level, ipix = ah.uniq_to_level_ipix(skymap["UNIQ"])
+    #     nside = ah.level_to_nside(level)
+    #     masked_list = []
+    #     nsides = []
+    #     for nside_i in nside[:i_region]:
+    #         if int(nside_i) not in nsides:
+    #             nsides.append(int(nside_i))
+    #     for nside_i in nsides:
+    #         masked_list.append({'nside': nside_i,
+    #                         'pixels': []})
+    #     for nside_i, ipix_i in zip(nside[:i_region], ipix[:i_region]):
+    #         for element in masked_list:
+    #             if element['nside'] == int(nside_i):
+    #                 element['pixels'].append(int(ipix_i))
+        
+    #     return masked_list
+
+    def get_hpx_regions(self, p_value):
+
+        ##DEBUG
+        print('reading map from: ', os.path.join(self.save_dir, self.map_name))
+
+        skymap = QTable.read(os.path.join(self.save_dir, self.map_name) )
+            
+        skymap.sort("PROBDENSITY", reverse=True)
+        
+        level, ipix = ah.uniq_to_level_ipix(skymap["UNIQ"])
+        nside = ah.level_to_nside(level)
+    
+    
+        prob_density = skymap['PROBDENSITY']
+        pixel_area = ah.nside_to_pixel_area(nside)
+    
+        prob = pixel_area * prob_density
+        
+        cumprob = np.cumsum(prob)
+        i_region = cumprob.searchsorted(p_value)
+        
+        selected_nside = nside[:i_region]
+        selected_ipix = ipix[:i_region]
+        
+        nside_selection = list(set(selected_nside)) 
+        masked_dict = {nside_i: [] for nside_i in nside_selection}
+        
+        for i in range(len(selected_nside)):
+            masked_dict[selected_nside[i]].append(int(selected_ipix[i]))
+    
+        masked_list = []
+        for nside_i in masked_dict.keys():
+            masked_list.append({
+                'nside': int(nside_i),
+                'pixels': masked_dict[nside_i]
+            })
+            
+        return masked_list
+
+
+# def deres(nside, ipix, min_nside=1):
+#     """
+#     Decompose a set of (nested) HEALpix indices into sets of complete superpixels at lower resolutions.
+#     :param nside: nside of given indices
+#     :param ipix: pixel indices
+#     :min_nside: minimum nside of complete pixels
+
+#     Copied from Ampel-ZTF-archive.
+#     """
+#     remaining_pixels = set(ipix)
+#     decomposed = defaultdict(list)
+#     for log2_nside in range(int(math.log2(min_nside)), int(math.log2(nside)) + 1):
+#         super_nside = 2**log2_nside
+#         # number of base_nside pixels per nside superpixel
+#         scale = (nside // super_nside) ** 2
+#         # sort remaining base_nside pixels by superpixel
+#         by_superpixel = defaultdict(list)
+#         for pix in remaining_pixels:
+#             by_superpixel[pix // scale].append(pix)
+#         # represent sets of pixels that fill a superpixel
+#         # as a single superpixel, and remove from the working set
+#         for superpix, members in by_superpixel.items():
+#             if len(members) == scale:
+#                 decomposed[super_nside].append(superpix)
+#                 remaining_pixels.difference_update(members)
+
+#     return dict(decomposed)
+
+def deres(healpix_regions):
     """
-    Decompose a set of (nested) HEALpix indices into sets of complete superpixels at lower resolutions.
-    :param nside: nside of given indices
-    :param ipix: pixel indices
-    :min_nside: minimum nside of complete pixels
-
-    Copied from Ampel-ZTF-archive.
+    Addition by Cris Z:
+    An adaptation of the deres function from AmpelHealpix.py that now works for multi-ordered maps.
+    
+    Compresses a list of HEALPix regions into the coarsest possible resolution 
+    by recursively merging groups of 4 sibling pixels into their parent.
+    
+    Parameters:
+    -----------
+    healpix_regions : list of dicts
+        Format: [{'nside': 1024, 'pixels': [...]}, {'nside': 512, 'pixels': [...]}]
+        
+    Returns:
+    --------
+    list of dicts
+        The minimized and coarsened pixel regions.
     """
-    remaining_pixels = set(ipix)
-    decomposed = defaultdict(list)
-    for log2_nside in range(int(math.log2(min_nside)), int(math.log2(nside)) + 1):
-        super_nside = 2**log2_nside
-        # number of base_nside pixels per nside superpixel
-        scale = (nside // super_nside) ** 2
-        # sort remaining base_nside pixels by superpixel
-        by_superpixel = defaultdict(list)
-        for pix in remaining_pixels:
-            by_superpixel[pix // scale].append(pix)
-        # represent sets of pixels that fill a superpixel
-        # as a single superpixel, and remove from the working set
-        for superpix, members in by_superpixel.items():
-            if len(members) == scale:
-                decomposed[super_nside].append(superpix)
-                remaining_pixels.difference_update(members)
-
-    return dict(decomposed)
-
+    # 1. Group all input pixels into sets mapped by their hierarchical order (order = log2(nside))
+    pixel_sets = {}
+    for region in healpix_regions:
+        nside = region['nside']
+        pixels = region['pixels']
+        order = int(np.round(np.log2(nside)))
+        if order not in pixel_sets:
+        # Using a set allows fast membership checks and removal during merging
+            pixel_sets[order] = set()
+        pixel_sets[order].update(pixels)
+        
+    # 2. Iteratively merge from fine (high order) to coarse (low order) 
+    # until no more groups of 4 siblings can be combined.
+    changed = True
+    while changed:
+        changed = False
+        orders = sorted(pixel_sets.keys(), reverse=True)
+        
+        for order in orders:
+            if order <= 0:
+                continue
+            current_pixels = pixel_sets.get(order, set())
+            if not current_pixels:
+                continue
+                
+            # Map parent pixel indices to their set of present children (0, 1, 2, or 3)
+            parent_dict = {}
+            for pix in current_pixels:
+                parent = pix // 4
+                remainder = pix % 4
+                if parent not in parent_dict:
+                    parent_dict[parent] = set()
+                parent_dict[parent].add(remainder)
+                
+            # Find parents that have all 4 children present ({0, 1, 2, 3})
+            parents_to_promote = [p for p, children in parent_dict.items() if children == {0, 1, 2, 3}]
+            
+            if parents_to_promote:
+                # Remove the 4 children from the current finer order
+                for parent in parents_to_promote:
+                    for i in range(4):
+                        current_pixels.remove(4 * parent + i)
+                        
+                # Add the parent to the next coarser order (order - 1)
+                lower_order = order - 1
+                if lower_order not in pixel_sets:
+                    pixel_sets[lower_order] = set()
+                pixel_sets[lower_order].update(parents_to_promote)
+                
+                # Flag that a merge occurred so the loop runs again 
+                # (allowing newly formed parents to cascade upward if possible)
+                changed = True
+                
+    # 3. Format the result back into your original list-of-dicts structure
+    compressed_regions = []
+    for order in sorted(pixel_sets.keys()):
+        if pixel_sets[order]:
+            compressed_regions.append({
+                'nside': int(2**order),
+                'pixels': sorted(list(pixel_sets[order]))
+            })
+            
+    return compressed_regions
 
 def main():
     # map_name = "/mnt/c/Users/Public/Documents/Uni/master/masterarbeit/ampel/new_BBH_mergers_O3a_IAS_pipeline/skymapGW190704_104834.fits.gz"

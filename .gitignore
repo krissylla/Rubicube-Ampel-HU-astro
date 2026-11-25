@@ -18,3 +18,5 @@ __pycache__
 *.pkl
 examples/artifacts
 examples/parsnipPlot
+.ipynb_checkpoints/
+

@@ -1,0 +1,203 @@
+name: classificationFromToken
+mongo:
+  prefix: lsst_rubicbue
+  reset: true
+channel:
+- name: lsst_rubicube
+  access: []
+  # - ZTF
+  # - ZTF_PUB
+  # - ZTF_PRIV
+  policy: []
+task:
+# - title: token
+#   unit: T4Processor
+#   config:
+#     raise_exc: true
+#     execute:
+#     - unit: T4RunTimeContextUpdater
+#       config:
+#         execute:
+#         - unit: HealpixTokenGenerator
+#           config:
+#             lsst: true
+#             pvalue_limit: 0.9
+#             map_name: IceCube-260217A_skymap_probdensity_multiorder.fits.gz
+#             map_url: https://roc-2.icecube.wisc.edu/public/alerts/IceCube-260217A_skymap_probdensity_multiorder.fits.gz
+#             map_dir: /Users/cristozilleruelo/Ampel-HU-astro/RubiCube/ic_alerts_temp
+#             date_str: '2026-02-17'
+#             delta_time: 10.0
+#             archive_token:
+#               label: ztf/archive/token
+#             archive: "https://ampel-dev.ia.zeuthen.desy.de/api/lsst/archive/v1/docs#/display/query_alerts_display_alerts_query_post"
+#             candidate:
+#               jdstarthist:
+#                 $gt: '2026-02-15'
+- title: filter
+  template:
+    live:
+    - resolve_run_time_aliases
+    - hash_t2_config
+  unit: AlertConsumer
+  config:
+    iter_max: 1000
+    compiler_opts: LSSTCompilerOptions
+
+    supplier:
+      unit: LSSTAlertSupplier
+      config:
+        deserialize: null
+        loader:
+          unit: LSSTArchiveAlertLoader
+          config:
+            archive_url: "https://ampel-dev.ia.zeuthen.desy.de/api/lsst/archive/v1/"
+            condition: "diaSource.reliability > 0.999 and diaSource.visit >= 202603150000"
+            location: 
+              ra:  149.9287
+              dec: 0.4177
+              radius: 0.002 #10 arcsec
+            insecure: true
+            
+            # condition: 
+            #   diaSource.reliability > 0.999 and diaSource.visit >= 2026022400000
+            # # order_by: "diaSource.visit"
+            # insecure: true
+            # position: '%%map_info'
+            
+    shaper: {unit: LSSTDataPointShaper}# shaper: ZiDataPointShaper
+    # compiler_opts: '%ZiCompilerOptionsAlias'
+    directives:
+    - channel: lsst_rubicube
+      filter:
+        config:
+          gaia_excessnoise_sig_max: 999
+          gaia_plx_signif: 3
+          gaia_pm_signif: 3
+          gaia_rs: 20
+          gaia_veto_gmag_max: 20
+          gaia_veto_gmag_min: 9
+          min_ndet: 1
+          min_tspan: -1
+          max_tspan: 365
+          min_archive_tspan: 0
+          max_archive_tspan: 365
+          min_gal_lat: -1.0
+          min_rb: 0.0
+          min_sso_dist: 20
+          ps1_confusion_rad: 3
+          ps1_confusion_sg_tol: 0.1
+          ps1_sgveto_rad: 1
+          ps1_sgveto_th: 0.8
+          max_fwhm: 5.5
+          max_elong: 1.4
+          max_magdiff: 1.0
+          max_nbad: 2
+        on_stock_match: bypass
+        unit: DecentFilter
+      ingest:
+        mux:
+          unit: ZiArchiveMuxer
+          config:
+            history_days: 999
+            future_days: 999
+          insert:
+            point_t2:
+            - config: '%T2CatalogMatch_general'
+              ingest:
+                filter: PPSFilter
+                select: first
+                sort: jd
+              unit: T2CatalogMatch
+          combine:
+          - state_t2:
+            - unit: T2LightCurveSummary
+            - config: &id002
+                significant_bands:
+                - ztfg
+                - ztfr
+                - ztfi
+                t_cadence: 3
+                tabulator:
+                - unit: ZTFT2Tabulator
+              unit: T2TabulatorRiseDecline
+            - unit: T2DigestRedshifts
+              config: &id001
+                max_redshift_category: 7
+                t2_dependency:
+                - config: '%T2CatalogMatch_general'
+                  link_override:
+                    filter: PPSFilter
+                    select: first
+                    sort: jd
+                  unit: T2CatalogMatch
+            - unit: T2InfantReport
+              config:
+                # report_t2s:
+                # - T2DigestRedshifts
+                # - T2TabulatorRiseDecline
+                tabulator:
+                - unit: ZTFT2Tabulator
+                t2_dependency:
+                - config: *id001
+                  link_override:
+                    filter: LSSTObjFilter
+                    select: last
+                    sort: diaObjectId
+                  unit: T2DigestRedshifts
+                - config: *id002
+                  link_override:
+                    filter: LSSTObjFilter
+                    select: last
+                    sort: diaObjectId
+                  unit: T2TabulatorRiseDecline
+            unit: ZiT1Combiner
+- title: Run T2s
+  unit: T2Worker
+  config:
+    send_beacon: false
+    raise_exc: true
+- title: React
+  template:
+      live:
+      - resolve_run_time_aliases
+  unit: T3Processor
+  config:
+    raise_exc: true
+    supply:
+      unit: T3DefaultBufferSupplier
+      config:
+        select:
+          unit: T3StockSelector
+          config:
+            channel: lsst_rubicube
+        load:
+          unit: T3SimpleDataLoader
+          config:
+            directives:
+            - STOCK
+            - T1
+            - T2DOC
+            - DATAPOINT
+            channel: lsst_rubicube
+        complement:
+        - unit: ZTFCutoutImages
+          config:
+            eligible: last
+        - unit: TNSNames
+          config:
+            include_report: true
+    stage:
+      unit: T3SimpleStager
+      config:
+        execute:
+        - unit: PlotTransientLightcurves
+          config:
+            # pdf_path: /Users/cristozilleruelo/Ampel-HU-astro/Rubicube/output/LSST_IceCube-260217A.pdf
+            save_png: false
+            include_cutouts: true
+            tabulator:
+              - unit: LSSTT2Tabulator
+                config:
+                  zp: 31.4
+            # healpix_info: '%%map_info'
+

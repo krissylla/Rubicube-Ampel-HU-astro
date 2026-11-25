@@ -1,0 +1,156 @@
+name: vroprept3
+
+mongo:
+  prefix: earlyarchive
+  reset: false
+
+task:
+- title: FindIaCand
+  unit: T3Processor
+  config:
+    raise_exc: true
+    supply:
+      unit: T3DefaultBufferSupplier
+      config:
+        select:
+          unit: T3FilteringStockSelector
+          config:
+            channel: earlyarchive
+            t2_filter:
+                all_of:
+                  - unit: T2ClassificationReport
+                    match:
+                      classification.models.probabilities.P(SNIa):
+                        "$gt": 0.020 
+                  - unit: T2ClassificationReport
+                    match:
+                      host.redshift:
+                        "$gt": 0.1 
+
+        load:
+          unit: T3SimpleDataLoader
+          config:
+            directives:
+              - STOCK
+              - T1
+              - T2DOC
+              - DATAPOINT
+            channel: earlyarchive
+        complement: 
+        - unit: LSSTCutoutImages
+          config:
+            eligible: brightest
+            insecure: true
+
+    stage:
+      unit: T3SimpleStager
+      config:
+        execute:
+          - unit: PlotTransientLightcurves
+            config:
+              pdf_path: /home/felix/Dokumente/Studium/PhD/LSST_Ampel/tmp/candidates_sneia_wholearchive.pdf
+              save_png: false
+              include_cutouts: true
+              tabulator:
+              - unit: LSSTT2Tabulator
+                config:
+                  zp: 31.4
+
+- title: FindIbcCand
+  unit: T3Processor
+  config:
+    raise_exc: true
+    supply:
+      unit: T3DefaultBufferSupplier
+      config:
+        select:
+          unit: T3FilteringStockSelector
+          config:
+            channel: earlyarchive
+            t2_filter:
+              all_of:
+                - unit: T2ClassificationReport
+                  match:
+                    classification.models.probabilities.P(SNibc):
+                      "$gt": 0.5
+                - unit: T2ClassificationReport
+                  match:
+                    host.redshift:
+                      "$gt": 0.1
+        load:
+          unit: T3SimpleDataLoader
+          config:
+            directives: [STOCK, T1, T2DOC, DATAPOINT]
+            channel: earlyarchive
+ 
+        complement:
+        - unit: LSSTCutoutImages
+          config:
+            eligible: brightest
+            insecure: true
+    stage:
+      unit: T3SimpleStager
+      config:
+        execute:
+          - unit: PlotTransientLightcurves
+            config:
+              pdf_path: /home/felix/Dokumente/Studium/PhD/LSST_Ampel/tmp/candidates_snibc.pdf
+              save_png: false
+              include_cutouts: true
+              tabulator:
+                - unit: LSSTT2Tabulator
+                  config:
+                    zp: 31.4
+
+
+- title: FindInfantSN
+  unit: T3Processor
+  config:
+    raise_exc: true
+    supply:
+      unit: T3DefaultBufferSupplier
+      config:
+        select:
+          unit: T3FilteringStockSelector
+          config:
+            channel: earlyarchive
+            t2_filter:
+              all_of:
+              - unit: T2InfantReport
+                match:
+                  host.redshift:
+                    "$lt": 0.05 
+              - unit: T2InfantReport
+                match:
+                  host.distance:
+                    "$lt": 10. 
+              - unit: T2InfantReport
+                match:
+                  features.features.t_lc:
+                    "$lt": 5. 
+        load:
+          unit: T3SimpleDataLoader
+          config:
+            directives:
+              - STOCK
+              - T1
+              - T2DOC
+              - DATAPOINT
+            channel: earlyarchive
+#        complement: 
+#        - unit: ZTFCutoutImages
+#          config:
+#            eligible: last
+    stage:
+      unit: T3SimpleStager
+      config:
+        execute:
+          - unit: PlotTransientLightcurves
+            config:
+              pdf_path: /home/felix/Dokumente/Studium/PhD/LSST_Ampel/tmp/candidates_infant.pdf
+              save_png: false
+              include_cutouts: true
+              tabulator:
+              - unit: LSSTT2Tabulator
+                config:
+                  zp: 31.4

@@ -18,6 +18,9 @@ from ampel.contrib.hu.util.AmpelHealpix import AmpelHealpix, deres
 from ampel.secret.NamedSecret import NamedSecret
 from ampel.types import UBson
 
+#debug for jvs
+import json
+
 
 class HealpixTokenGenerator(AbsT4Unit):
     """
@@ -38,7 +41,8 @@ class HealpixTokenGenerator(AbsT4Unit):
 
     archive_token: NamedSecret[str] = NamedSecret(label="ztf/archive/token")
     #: Base URL of archive service
-    archive: str = "https://ampel.zeuthen.desy.de/api/ztf/archive/v3/"
+    # archive: str = "https://ampel.zeuthen.desy.de/api/ztf/archive/v3/"
+    archive: str = "https://ampel-ztf.zeuthen.desy.de/api/ztf/archive/v3/"
 
     date_str: None | str = (
         None  # Start of time window we are interested in (default: event trigger time)
@@ -58,6 +62,9 @@ class HealpixTokenGenerator(AbsT4Unit):
 
     debug: bool = False
 
+    #flag for testing
+    lsst: bool = False
+
     def do(self) -> UBson:
         # Retrieve and process map
         ah = AmpelHealpix(
@@ -68,7 +75,7 @@ class HealpixTokenGenerator(AbsT4Unit):
         # Get list of pixels within requested significance contour
         pixels = ah.get_pixelmask(self.pvalue_limit)
         self.logger.info(
-            "",
+            "HI I'M A LOGGER MESSAGE", #"" TEST
             extra={
                 "map": self.map_name,
                 "hash": map_hash,
@@ -107,19 +114,40 @@ class HealpixTokenGenerator(AbsT4Unit):
         session.headers["authorization"] = f"bearer {self.archive_token.get()}"
 
         # Combine pixels when possible
-        deresdict = deres(ah.nside, pixels)
-        healpix_regions = [
-            {"nside": nside, "pixels": members} for nside, members in deresdict.items()
-        ]
+        # deresdict = deres(ah.nside, pixels)
+        # healpix_regions = [
+            # {"nside": nside, "pixels": members} for nside, members in deresdict.items()
+        # ]
 
-        hp_area = ah.get_maparea(self.pvalue_limit)
+        #cris attempt
+        healpix_regions = ah.get_hpx_regions(self.pvalue_limit)
+        self.logger.info("healpipx regions computed")
+
+        #now combine the pixels when possible, we call deres
+        healpix_regions = deres(healpix_regions)
+
+        hp_area = ah.get_maparea(self.pvalue_limit, healpix_regions)
+
+        if self.debug:
+            print('healpix regions: ')
+            print(healpix_regions)
+            print('map area: ', hp_area)
 
         candidate_dict = {
             "rb": {"$gt": 0.3},
             "magpsf": {"$gt": 15},
-            "ndethist": {"$gt": 0, "$lte": 10},
-            "jdstarthist": {"$gt": start_jd},
+            "ndethist": {"$gt": 0, "$lte": 100},
+            "jd": {"$gt": start_jd}, #TEST first time this alert was seen
         }
+        
+        #TODO: fix this in an elegant way
+        if 'jdstarthist' in self.candidate.keys():
+            #we turn this into a Time() object
+            self.candidate['jdstarthist']['$gt'] = Time(self.candidate['jdstarthist']['$gt'],
+                    format=self.date_format,
+                    scale="utc",
+                ).jd
+
 
         candidate_dict.update(self.candidate)
 
@@ -130,66 +158,98 @@ class HealpixTokenGenerator(AbsT4Unit):
             "candidate": candidate_dict,
             "chunk_size": self.chunk_size,
         }
-
+       
         # count alerts before trigger time without querying for them
-        count_query_dict = {
-            "jd": {"$gt": start_jd, "$lt": end_jd},
-            "regions": healpix_regions,
-        }
-        endpoint_count = "https://ampel.zeuthen.desy.de/api/ztf/archive/v3/alerts/healpix/skymap/count"
-        response_count = session.post(endpoint_count, json=count_query_dict)
-        alert_count_nofilter = response_count.json()["count"]
+        if not self.lsst:
+            count_query_dict = {
+                "jd": {"$gt": start_jd, "$lt": end_jd},
+                "regions": healpix_regions,
+            }
+            
+            # endpoint_count = "https://ampel.zeuthen.desy.de/api/ztf/archive/v3/alerts/healpix/skymap/count"
+            #CRIS
+            if 'lsst' in self.archive:
+                endpoint_count = self.archive
+            else:
+                endpoint_count =  self.archive + "alerts/healpix/skymap/count"
+            response_count = session.post(endpoint_count, json=count_query_dict)
+            response_count.raise_for_status()
+            
+            alert_count_nofilter = response_count.json()["count"]
 
-        response = session.post(
-            "streams/from_query",
-            json=query_dict,
-        )
-        response.raise_for_status()
-
-        rd = response.json()
-        try:
-            token = rd.pop("resume_token")
-        except KeyError as exc:
-            raise ValueError(f"Unexpected response: {rd}") from exc
-
-        # wait for query to finish - is this needed, or handled by alert consumer?
-        t0 = time.time()
-        delay = 1
-        while time.time() - t0 < self.timeout:
-            response = session.get(f"stream/{token}")
-            if response.status_code != 423:
-                break
-            time.sleep(random.uniform(0, delay))
-            delay *= 2
-        else:
-            raise RuntimeError(
-                f"{session.base_url}stream/{token} still locked after {time.time() - t0:.0f} s"
+            response = session.post(
+                "streams/from_query",
+                json=query_dict,
             )
-        self.logger.info("Stream created", extra=response.json())
+            response.raise_for_status()
 
-        if response.json().get("remaining"):
-            queried_alerts = response.json()["remaining"]["items"]
-        else:
-            queried_alerts = 0
-        # Package resource needed
-        resource = {
-            "map_name": self.map_name,
-            "map_dir": self.map_dir,
-            "map_url": self.map_url,
-            "hash": map_hash,
-            "token": token,
-            "jd": ah.trigger_time,
-            "map_area": hp_area,
-            "alert_count_nofilter": alert_count_nofilter,
-            "alert_count_query": queried_alerts,
-        }
+            rd = response.json()
+            try:
+                token = rd.pop("resume_token")
+            except KeyError as exc:
+                raise ValueError(f"Unexpected response: {rd}") from exc
 
-        return {
-            self.map_name: resource,
-            self.map_name + "_token": token,
-            "healpix_map_dir": self.map_dir,
-            "healpix_map_hash": map_hash,
-            "healpix_map_name": self.map_name,
-            "map_area": hp_area,
-            "alert_count_nofilter": alert_count_nofilter,
-        }
+            # wait for query to finish - is this needed, or handled by alert consumer?
+            t0 = time.time()
+            delay = 1
+            while time.time() - t0 < self.timeout:
+                response = session.get(f"stream/{token}")
+                if response.status_code != 423:
+                    break
+                time.sleep(random.uniform(0, delay))
+                delay *= 2
+            else:
+                raise RuntimeError(
+                    f"{session.base_url}stream/{token} still locked after {time.time() - t0:.0f} s"
+                )
+            self.logger.info("Stream created", extra=response.json())
+
+            if response.json().get("remaining"):
+                queried_alerts = response.json()["remaining"]["items"]
+            else:
+                queried_alerts = 0
+            # Package resource needed
+            resource = {
+                "map_name": self.map_name,
+                "map_dir": self.map_dir,
+                "map_url": self.map_url,
+                "hash": map_hash,
+                "token": token,
+                "jd": ah.trigger_time,
+                "map_area": hp_area,
+                "alert_count_nofilter": alert_count_nofilter,
+                "alert_count_query": queried_alerts,
+                "healpix_regions": healpix_regions, #cris attempt at debugging the selected pixelss
+                "p_value": self.pvalue_limit,
+            }
+        
+
+            return {
+                self.map_name: resource,
+                self.map_name + "_token": token,
+                "healpix_map_dir": self.map_dir,
+                "healpix_map_hash": map_hash,
+                "healpix_map_name": self.map_name,
+                "map_area": hp_area,
+                "alert_count_nofilter": alert_count_nofilter,
+                "map_info": resource,
+            }
+        if self.lsst:
+                resource = {
+                    "map_name": self.map_name,
+                    "map_dir": self.map_dir,
+                    "map_url": self.map_url,
+                    "hash": map_hash,
+                    "jd": ah.trigger_time,
+                    "map_area": hp_area,
+                    "healpix_regions": healpix_regions, #cris attempt at debugging the selected pixelss
+                    "p_value": self.pvalue_limit,
+                }
+                return {
+                self.map_name: resource,
+                "healpix_map_dir": self.map_dir,
+                "healpix_map_hash": map_hash,
+                "healpix_map_name": self.map_name,
+                "map_area": hp_area,
+                "map_info": resource,
+            }

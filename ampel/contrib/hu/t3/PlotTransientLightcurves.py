@@ -1085,7 +1085,8 @@ class PlotTransientLightcurves(AbsPhotoT3Unit, AbsTabulatedT2Unit):
 
     def _is_upperlimit_dp(self, dp: DataPoint) -> bool:
         body = dp.get("body") or {}
-        return isinstance(body, dict) and "diffmaglim" in body
+        # return isinstance(body, dict) and "diffmaglim" in body #for LSST
+        return isinstance(body, dict) and "magpsf" not in body #for ZTF
 
     def _get_photopoints_any_id(self, tview: TransientView) -> list[DataPoint]:
         dps = self._iter_t0(tview)
@@ -1101,8 +1102,10 @@ class PlotTransientLightcurves(AbsPhotoT3Unit, AbsTabulatedT2Unit):
         buffer = io.BytesIO()
         with PdfPages(self.pdf_path or buffer) as pdf:
             for tran_view in gen:
+                # print('t0: ', tran_view.t0)
                 photopoints = self._get_photopoints_any_id(tran_view)
                 if not photopoints:
+                    # print("No photopoints for id: ", tran_view.id)
                     self.logger.debug("No photopoints", extra={"stock": tran_view.id})
                     continue
 
@@ -1110,6 +1113,7 @@ class PlotTransientLightcurves(AbsPhotoT3Unit, AbsTabulatedT2Unit):
 
                 sncosmo_table = sncosmo_table[sncosmo_table["flux"] > 0]
                 if sncosmo_table is None or len(sncosmo_table) == 0:
+                    print("HERE 2")
                     self.logger.debug("No pos flux", extra={"stock": tran_view.id})
                     continue
 

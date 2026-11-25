@@ -76,11 +76,11 @@ task:
             # https://box.hu-berlin.de/f/78d7594841da4653a743/?dl=1
             # box name: parsnipModelAug10Pct30.h5
             # old name: model1-30pct-sn+2ulens+dwarfs-mw.h5
-            model: /Users/jnordin/github/ampelFeb25/Ampel-HU-astro/examples/parsnipModelAug10Pct30.h5
+            model: /Users/cristozilleruelo/Desktop/DESY/AMPEL_classifiers/parsnipModelAug10Pct30.h5
             # https://box.hu-berlin.de/f/d1cec88c0bec4123b208/?dl=1
             # box name: parsnipClassifierAug10Pct30.pkl 
             # old name: model1-30pct-sn+2ulens+dwarfs-mw-aug10.pkl
-            classifier: /Users/jnordin/github/ampelFeb25/Ampel-HU-astro/examples/parsnipClassifierAug10Pct30.pkl
+            classifier: /Users/cristozilleruelo/Desktop/DESY/AMPEL_classifiers/parsnipClassifierAug10Pct30.pkl
         return_features: true
         # T2TabulatorRiseDecline
         significant_bands:
